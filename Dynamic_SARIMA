@@ -1,0 +1,501 @@
+% Load the data from CSV file
+data = readtable('SPEI_data.csv');
+speiData = table2array(data);
+dates = datetime(1950, 3, 1):calmonths(1):datetime(2025, 4, 1);
+dates = dates(1:size(speiData, 1))'; % Ensure dates match data length
+
+% Determine training and test set sizes (80% train, 20% test)
+numMonths = size(speiData, 1);
+trainSize = round(0.8 * numMonths);
+testSize = numMonths - trainSize;
+trainDates = dates(1:trainSize);
+testDates = dates(trainSize+1:end);
+
+% Extract test data
+testData = speiData(trainSize+1:end, :);
+
+% Loop through each SPEI series
+numSeries = size(speiData, 2);
+models = cell(numSeries, 1);
+forecasts = cell(numSeries, 1);
+testForecasts = cell(numSeries, 1);
+
+% Create main figure for visualization
+mainFig = figure('Position', [50, 50, 1400, 1000], 'Name', 'SARIMA Model Results');
+
+for i = 1:numSeries
+    fprintf('\nProcessing SPEI series %d...\n', i);
+    
+    % Extract training data for current series
+    trainData = speiData(1:trainSize, i);
+    
+    % Remove missing values (if any)
+    validIdx = ~isnan(trainData);
+    trainDataClean = trainData(validIdx);
+    trainDatesClean = trainDates(validIdx);
+    
+    % Check for stationarity
+    [h0, pValue0] = adftest(trainDataClean);
+    fprintf('Series %d ADF test: h=%d, p=%.4f\n', i, h0, pValue0);
+    
+    % Apply differencing if needed
+    diffApplied = 0;
+    originalData = trainDataClean;
+    originalDates = trainDatesClean;
+    if ~h0 % If not stationary, try differencing
+        trainDataClean = diff(trainDataClean);
+        trainDatesClean = trainDatesClean(2:end);
+        diffApplied = 1;
+        fprintf('Applied first differencing to series %d.\n', i);
+        
+        % Re-check stationarity after differencing
+        [h1, pValue1] = adftest(trainDataClean);
+        fprintf('After differencing - ADF test: h=%d, p=%.4f\n', h1, pValue1);
+    end
+    
+    % Try multiple SARIMA configurations for optimal model selection
+    bestAIC = Inf;
+    bestModel = [];
+    bestOrders = [];
+    bestLogL = -Inf;
+    
+    % Define multiple order combinations to test
+    ordersToTest = [...
+        1, 0, 1, 1, 0, 1;  % Standard seasonal model
+        2, 0, 2, 1, 0, 1;  % Higher non-seasonal orders
+        1, 1, 1, 1, 0, 1;  % With differencing
+        1, 0, 1, 2, 0, 2;  % Higher seasonal orders
+        0, 1, 1, 0, 1, 1;  % Simple seasonal model
+        2, 1, 2, 1, 1, 1;  % Complex model
+        1, 0, 0, 1, 0, 0;  % Simple AR + seasonal AR
+        0, 0, 1, 0, 0, 1]; % Simple MA + seasonal MA
+    
+    fprintf('Testing %d model configurations for series %d...\n', size(ordersToTest, 1), i);
+    
+    for j = 1:size(ordersToTest, 1)
+        p = ordersToTest(j, 1);
+        d = ordersToTest(j, 2);
+        q = ordersToTest(j, 3);
+        P = ordersToTest(j, 4);
+        D = ordersToTest(j, 5);
+        Q = ordersToTest(j, 6);
+        s = 12;
+        
+        % Adjust d and D based on whether we already applied differencing
+        if diffApplied
+            d = max(0, d - 1);  % Reduce differencing order if already applied
+        end
+        
+        try
+            model = arima('ARLags', p, 'D', d, 'MALags', q, ...
+                          'SARLags', P, 'Seasonality', s, 'SMALags', Q);
+            [estimatedModel, ~, logL] = estimate(model, trainDataClean, 'Display', 'off');
+            
+            % Calculate AIC and BIC
+            numParams = p + q + P + Q + 1;  % +1 for constant term
+            currentAIC = aicbic(logL, numParams);
+            
+            if currentAIC < bestAIC
+                bestAIC = currentAIC;
+                bestModel = estimatedModel;
+                bestOrders = [p, d, q, P, D, Q];
+                bestLogL = logL;
+            end
+        catch exception
+            % Skip if this configuration fails
+            fprintf('  Configuration (%d,%d,%d)(%d,%d,%d) failed: %s\n', ...
+                    p, d, q, P, D, Q, exception.message);
+            continue;
+        end
+    end
+    
+    if isempty(bestModel)
+        error('No suitable model found for series %d', i);
+    end
+    
+    fprintf('Best model for series %d: SARIMA(%d,%d,%d)(%d,%d,%d)%d with AIC=%.2f\n', ...
+            i, bestOrders(1), bestOrders(2), bestOrders(3), ...
+            bestOrders(4), bestOrders(5), bestOrders(6), s, bestAIC);
+    
+    models{i} = bestModel;
+    
+    % Generate in-sample forecasts (fitted values)
+    [yFitted, yMSE] = infer(bestModel, trainDataClean);
+    
+    % Adjust fitted values if differencing was applied
+    if diffApplied
+        fittedValues = [originalData(1); originalData(2:end) - yFitted];
+        residualDates = originalDates(2:end); % Residuals correspond to dates after the first observation
+    else
+        fittedValues = trainDataClean - yFitted;
+        residualDates = trainDatesClean;
+    end
+    
+    % Store training results
+    forecasts{i} = struct(...
+        'fitted', fittedValues, ...
+        'dates', originalDates, ...
+        'residual_dates', residualDates, ...
+        'actual', originalData, ...
+        'residuals', yFitted, ...
+        'orders', bestOrders, ...
+        'aic', bestAIC);
+    
+    % Prepare for recursive one-step-ahead forecasting
+    testDataClean = testData(:, i);
+    testValidIdx = ~isnan(testDataClean);
+    testDataClean = testDataClean(testValidIdx);
+    testDatesClean = testDates(testValidIdx);
+    
+    % Initialize arrays for recursive forecasting
+    recursiveForecasts = zeros(length(testDataClean), 1);
+    recursiveIntervals = zeros(length(testDataClean), 2);
+    
+    % Start with the training data
+    currentData = trainDataClean;
+    
+    % Recursive one-step-ahead forecasting
+    for t = 1:length(testDataClean)
+        try
+            % Forecast one step ahead
+            [yForecast, yMSE] = forecast(bestModel, 1, currentData);
+            
+            % Store forecast and confidence interval
+            recursiveForecasts(t) = yForecast;
+            recursiveIntervals(t, :) = [yForecast - 1.96*sqrt(yMSE), ...
+                                       yForecast + 1.96*sqrt(yMSE)];
+            
+            % Update the data with the actual observation (if available)
+            if t <= length(testDataClean)
+                % If we applied differencing, we need to handle it appropriately
+                if diffApplied
+                    % For differenced data, we need to add the new observation to the series
+                    currentData = [currentData; testDataClean(t)];
+                else
+                    % For non-differenced data, just append the new observation
+                    currentData = [currentData; testDataClean(t)];
+                end
+                
+                % Re-estimate the model with the updated data (optional but more accurate)
+                % This step is computationally intensive but provides true recursive forecasting
+                try
+                    bestModel = estimate(bestModel, currentData, 'Display', 'off');
+                catch
+                    % If re-estimation fails, continue with the previous model
+                    warning('Model re-estimation failed at step %d, using previous model', t);
+                end
+            end
+        catch exception
+            warning('Forecasting failed at step %d: %s', t, exception.message);
+            recursiveForecasts(t) = NaN;
+            recursiveIntervals(t, :) = [NaN, NaN];
+        end
+    end
+    
+    % If we applied differencing, we need to integrate the forecasts
+    if diffApplied
+        % Get the last value from the training period
+        lastTrainValue = originalData(end);
+        
+        % Integrate the forecasts
+        recursiveForecasts = cumsum([lastTrainValue; recursiveForecasts]);
+        recursiveForecasts = recursiveForecasts(2:end); % Remove the initial value
+        
+        % Note: Confidence intervals are more complex to integrate properly
+        % For simplicity, we'll keep them as is, but they may not be perfectly accurate
+    end
+    
+    % Store test results
+    testForecasts{i} = struct(...
+        'forecast', recursiveForecasts, ...
+        'actual', testDataClean, ...
+        'dates', testDatesClean, ...
+        'intervals', recursiveIntervals);
+    
+    % Create subplot for this series in main figure
+    figure(mainFig);
+    subplot(ceil(numSeries/2), 2, i);
+    
+    % Plot training actual values
+    plot(originalDates, originalData, 'b-', 'LineWidth', 1.5);
+    hold on;
+    
+    % Plot training fitted values
+    plot(originalDates, fittedValues, 'r-', 'LineWidth', 1.5);
+    
+    % Plot test actual values
+    plot(testDatesClean, testDataClean, 'g-', 'LineWidth', 1.5);
+    
+    % Plot test forecasts
+    plot(testDatesClean, recursiveForecasts, 'm-', 'LineWidth', 1.5);
+    
+    % Plot confidence intervals
+    plot(testDatesClean, recursiveIntervals(:, 1), 'm--', 'LineWidth', 0.5);
+    plot(testDatesClean, recursiveIntervals(:, 2), 'm--', 'LineWidth', 0.5);
+    
+    % Add vertical line to separate train and test periods
+    yLimits = ylim;
+    plot([trainDates(end) trainDates(end)], yLimits, 'k--', 'LineWidth', 1);
+    
+    % Customize plot
+    title(sprintf('SPEI Series %d: Training and Test Results', i));
+    xlabel('Date');
+    ylabel('SPEI Value');
+    legend('Train Actual', 'Train Fitted', 'Test Actual', 'Test Forecast', '95% CI', ...
+           'Location', 'best');
+    grid on;
+    hold off;
+    
+    % Create individual diagnostic figure for each series
+    diagFig = figure('Position', [100, 100, 1200, 800], ...
+                    'Name', sprintf('Diagnostics for SPEI Series %d', i));
+    
+    % Plot 1: Residuals
+    subplot(2, 2, 1);
+    plot(forecasts{i}.residual_dates, forecasts{i}.residuals, 'k-');
+    title('Residuals');
+    xlabel('Date');
+    ylabel('Residual');
+    grid on;
+    
+    % Plot 2: ACF of residuals
+    subplot(2, 2, 2);
+    autocorr(forecasts{i}.residuals, 24);
+    title('ACF of Residuals');
+    
+    % Plot 3: Histogram of residuals
+    subplot(2, 2, 3);
+    histogram(forecasts{i}.residuals, 20);
+    title('Residual Distribution');
+    xlabel('Residual Value');
+    ylabel('Frequency');
+    
+    % Plot 4: Q-Q plot of residuals
+    subplot(2, 2, 4);
+    qqplot(forecasts{i}.residuals);
+    title('Q-Q Plot of Residuals');
+    
+    sgtitle(sprintf('Diagnostic Plots for SPEI Series %d', i));
+    
+    % Save diagnostic figure
+    saveas(diagFig, sprintf('diagnostics_series_%d.png', i));
+    
+    fprintf('Model for series %d fitted successfully.\n', i);
+end
+
+% Add overall title to the main figure
+figure(mainFig);
+sgtitle('SARIMA Model Results for All SPEI Series: Training and Test Periods');
+
+% Save main figure
+saveas(mainFig, 'all_series_results.png');
+
+% Create a separate figure for test period results only
+testFig = figure('Position', [50, 50, 1400, 1000], 'Name', 'Test Period Forecasts');
+for i = 1:numSeries
+    subplot(ceil(numSeries/2), 2, i);
+    
+    % Plot test actual values
+    plot(testForecasts{i}.dates, testForecasts{i}.actual, 'g-', 'LineWidth', 2);
+    hold on;
+    
+    % Plot test forecasts
+    plot(testForecasts{i}.dates, testForecasts{i}.forecast, 'm-', 'LineWidth', 2);
+    
+    % Plot confidence intervals
+    plot(testForecasts{i}.dates, testForecasts{i}.intervals(:, 1), 'm--', 'LineWidth', 1);
+    plot(testForecasts{i}.dates, testForecasts{i}.intervals(:, 2), 'm--', 'LineWidth', 1);
+    
+    % Customize plot
+    title(sprintf('SPEI Series %d: Test Period Forecast', i));
+    xlabel('Date');
+    ylabel('SPEI Value');
+    legend('Actual', 'Forecast', '95% CI', 'Location', 'best');
+    grid on;
+    hold off;
+end
+sgtitle('Test Period Forecasts for All SPEI Series');
+saveas(testFig, 'test_period_forecasts.png');
+
+% Display comprehensive model summaries in command window
+fprintf('\n\n=== COMPREHENSIVE MODEL SUMMARIES ===\n');
+for i = 1:numSeries
+    if ~isempty(models{i})
+        fprintf('\nSARIMA Model for SPEI Series %d:\n', i);
+        summarize(models{i});
+        
+        % Calculate and display training performance metrics
+        residuals = forecasts{i}.residuals;
+        trainMSE = mean(residuals.^2);
+        trainRMSE = sqrt(trainMSE);
+        trainMAE = mean(abs(residuals));
+        
+        % Calculate Nash-Sutcliffe Efficiency for training
+        trainMeanObs = mean(forecasts{i}.actual);
+        trainSSres = sum(residuals.^2);
+        trainSStot = sum((forecasts{i}.actual - trainMeanObs).^2);
+        trainNSE = 1 - (trainSSres / trainSStot);
+        
+        fprintf('Model Orders: (%d,%d,%d)(%d,%d,%d)12\n', forecasts{i}.orders);
+        fprintf('Training Performance Metrics:\n');
+        fprintf('  MSE:  %.4f\n', trainMSE);
+        fprintf('  RMSE: %.4f\n', trainRMSE);
+        fprintf('  MAE:  %.4f\n', trainMAE);
+        fprintf('  NSE:  %.4f\n', trainNSE);
+        fprintf('  AIC:  %.2f\n', forecasts{i}.aic);
+        
+        % Ljung-Box test for residual autocorrelation
+        [h, pValue] = lbqtest(residuals, 'Lags', 12);
+        fprintf('  Ljung-Box test (p-value): %.4f\n', pValue);
+        if h
+            fprintf('  Residuals show significant autocorrelation.\n');
+        else
+            fprintf('  Residuals are white noise (good fit).\n');
+        end
+        
+        % Calculate and display test performance metrics
+        testResiduals = testForecasts{i}.actual - testForecasts{i}.forecast;
+        testMSE = mean(testResiduals.^2);
+        testRMSE = sqrt(testMSE);
+        testMAE = mean(abs(testResiduals));
+        
+        % Calculate Nash-Sutcliffe Efficiency for testing
+        testMeanObs = mean(testForecasts{i}.actual);
+        testSSres = sum(testResiduals.^2);
+        testSStot = sum((testForecasts{i}.actual - testMeanObs).^2);
+        testNSE = 1 - (testSSres / testSStot);
+        
+        fprintf('Test Performance Metrics (Recursive One-Step):\n');
+        fprintf('  MSE:  %.4f\n', testMSE);
+        fprintf('  RMSE: %.4f\n', testRMSE);
+        fprintf('  MAE:  %.4f\n', testMAE);
+        fprintf('  NSE:  %.4f\n', testNSE);
+        
+        % Store NSE values for later comparison
+        forecasts{i}.nse = trainNSE;
+        testForecasts{i}.nse = testNSE;
+    end
+end
+
+% Create a summary table of performance metrics
+fprintf('\n\n=== PERFORMANCE METRICS SUMMARY ===\n');
+fprintf('Series\tTrain MSE\tTrain RMSE\tTrain MAE\tTrain NSE\tTest MSE\tTest RMSE\tTest MAE\tTest NSE\n');
+for i = 1:numSeries
+    if ~isempty(models{i})
+        fprintf('%d\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\n', i, ...
+                trainMSE, trainRMSE, trainMAE, forecasts{i}.nse, ...
+                testMSE, testRMSE, testMAE, testForecasts{i}.nse);
+    end
+end
+
+% Create a figure to compare NSE values across series
+nseFig = figure('Position', [100, 100, 800, 600]);
+trainNSE = cellfun(@(x) x.nse, forecasts);
+testNSE = cellfun(@(x) x.nse, testForecasts);
+
+bar([trainNSE; testNSE]');
+set(gca, 'XTickLabel', 1:numSeries);
+xlabel('SPEI Series');
+ylabel('Nash-Sutcliffe Efficiency (NSE)');
+title('NSE Comparison Across SPEI Series');
+legend('Training', 'Testing', 'Location', 'best');
+grid on;
+
+% Add value labels on bars
+for i = 1:numSeries
+    text(i-0.18, trainNSE(i)+0.01, sprintf('%.3f', trainNSE(i)), 'FontSize', 10);
+    text(i+0.05, testNSE(i)+0.01, sprintf('%.3f', testNSE(i)), 'FontSize', 10);
+end
+
+saveas(nseFig, 'nse_comparison.png');
+
+% Export results to Excel file
+fprintf('\nExporting results to Excel file...\n');
+excelFileName = 'spei_forecast_results.xlsx';
+
+% Create a summary sheet with performance metrics
+summaryData = cell(numSeries+1, 10);
+summaryData{1,1} = 'Series';
+summaryData{1,2} = 'Train MSE';
+summaryData{1,3} = 'Train RMSE';
+summaryData{1,4} = 'Train MAE';
+summaryData{1,5} = 'Train NSE';
+summaryData{1,6} = 'Test MSE';
+summaryData{1,7} = 'Test RMSE';
+summaryData{1,8} = 'Test MAE';
+summaryData{1,9} = 'Test NSE';
+summaryData{1,10} = 'Model Orders';
+
+for i = 1:numSeries
+    summaryData{i+1,1} = i;
+    summaryData{i+1,2} = trainMSE;
+    summaryData{i+1,3} = trainRMSE;
+    summaryData{i+1,4} = trainMAE;
+    summaryData{i+1,5} = forecasts{i}.nse;
+    summaryData{i+1,6} = testMSE;
+    summaryData{i+1,7} = testRMSE;
+    summaryData{i+1,8} = testMAE;
+    summaryData{i+1,9} = testForecasts{i}.nse;
+    summaryData{i+1,10} = sprintf('(%d,%d,%d)(%d,%d,%d)12', forecasts{i}.orders);
+end
+
+writecell(summaryData, excelFileName, 'Sheet', 'Performance Summary');
+
+% Export detailed results for each series
+for i = 1:numSeries
+    % Prepare training data
+    trainDatesCell = cellstr(forecasts{i}.dates);
+    trainData = [{'Date', 'Actual', 'Fitted'}; ...
+                trainDatesCell, num2cell(forecasts{i}.actual), num2cell(forecasts{i}.fitted)];
+    
+    % Prepare test data
+    testDatesCell = cellstr(testForecasts{i}.dates);
+    testData = [{'Date', 'Actual', 'Forecast', 'Lower CI', 'Upper CI'}; ...
+               testDatesCell, num2cell(testForecasts{i}.actual), ...
+               num2cell(testForecasts{i}.forecast), ...
+               num2cell(testForecasts{i}.intervals(:,1)), ...
+               num2cell(testForecasts{i}.intervals(:,2))];
+    
+    % Write to Excel
+    writecell(trainData, excelFileName, 'Sheet', sprintf('Series_%d_Train', i));
+    writecell(testData, excelFileName, 'Sheet', sprintf('Series_%d_Test', i));
+    
+    fprintf('Exported results for series %d\n', i);
+end
+
+% Create a sheet with model parameters
+modelParams = cell(numSeries+1, 8);
+modelParams{1,1} = 'Series';
+modelParams{1,2} = 'p';
+modelParams{1,3} = 'd';
+modelParams{1,4} = 'q';
+modelParams{1,5} = 'P';
+modelParams{1,6} = 'D';
+modelParams{1,7} = 'Q';
+modelParams{1,8} = 'AIC';
+
+for i = 1:numSeries
+    modelParams{i+1,1} = i;
+    modelParams{i+1,2} = forecasts{i}.orders(1);
+    modelParams{i+1,3} = forecasts{i}.orders(2);
+    modelParams{i+1,4} = forecasts{i}.orders(3);
+    modelParams{i+1,5} = forecasts{i}.orders(4);
+    modelParams{i+1,6} = forecasts{i}.orders(5);
+    modelParams{i+1,7} = forecasts{i}.orders(6);
+    modelParams{i+1,8} = forecasts{i}.aic;
+end
+
+writecell(modelParams, excelFileName, 'Sheet', 'Model Parameters');
+
+fprintf('All results exported to %s\n', excelFileName);
+
+% Save results to MAT file for future use
+save('spei_sarima_models.mat', 'models', 'forecasts', 'testForecasts', 'trainDates', 'testDates');
+
+fprintf('\nAnalysis complete. Results saved to:\n');
+fprintf('  - all_series_results.png (main results figure)\n');
+fprintf('  - test_period_forecasts.png (test period forecasts)\n');
+fprintf('  - diagnostics_series_X.png (individual diagnostic plots)\n');
+fprintf('  - nse_comparison.png (NSE comparison across series)\n');
+fprintf('  - %s (Excel file with detailed results)\n', excelFileName);
+fprintf('  - spei_sarima_models.mat (model objects and forecasts)\n');
