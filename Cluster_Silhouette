@@ -1,0 +1,127 @@
+% k-means clustering   based on lat, lon, elev, and SPEI series that uses MATLAB's built-in kmeans function 
+% The algorithm uses Silhouette Analysis to optimise the k value.
+% Developed by Ali Danandeh Mehr (September 2025)
+clc;
+clear all;
+% ==================== 1. Load Data =======================================
+data = readmatrix('stations.csv');   % file: stationID, SPEI..., lat, lon, elev.
+stationID = data(:,1);
+SPEI = data(:,2:end-3);    % SPEI columns
+lat = data(:,end-2);
+lon = data(:,end-1);
+elev = data(:,end);
+
+% =================== 2. Build Feature Matrix ============================
+X = [SPEI, lat, lon, elev];
+
+% ==================== 3. Silhouette Analysis ============================
+maxK = 9;
+silh_avg = zeros(maxK,1);
+for k = 2:maxK
+    labels_tmp = kmeans(X, k, 'Replicates',10,'Options',statset('MaxIter',500));
+    s = silhouette(X, labels_tmp);
+    silh_avg(k) = mean(s);
+end
+figure; % Fig 1
+plot(2:maxK, silh_avg(2:end), '-o','LineWidth',1.5);
+xlabel('Number of clusters (k)');
+ylabel('Average Silhouette Score');
+title('Silhouette Analysis for Optimal k');
+grid on;
+[~,bestK] = max(silh_avg);
+fprintf('Optimal number of clusters based on silhouette = %d\n', bestK);
+
+% =================== 4. Run K-means =================================
+opts = statset('MaxIter',1000,'Display','final');
+[labels, centroids] = kmeans(X, bestK, ...
+    'Replicates',20, 'Options',opts, 'Distance','sqeuclidean');
+
+% =================== 5. Save Results ================================
+results = [stationID, labels];
+writematrix(results, 'station_clusters.csv');
+disp('Cluster assignments saved to station_clusters.csv');
+
+% =================== 6. Plot grid points on Map ========================
+figure; % Fig 2
+gscatter(lon, lat, labels, lines(bestK), 'o', 8);
+xlabel('Longitude'); ylabel('Latitude');
+title(sprintf('K-means Clustering of GDM points (k=%d)',bestK));
+legend(arrayfun(@(x) sprintf('Cluster %d',x),1:bestK,'UniformOutput',false));
+grid on;
+
+% ==================== 7. Plot Centroid SPEI Profiles ================
+figure; % Fig 3
+for i = 1:bestK
+    plot(centroids(i,1:size(SPEI,2)),'LineWidth',1.5); hold on;
+end
+xlabel('Time step (month)');
+ylabel('SPEI');
+title('Cluster Centroid SPEI series');
+legend(arrayfun(@(x) sprintf('Cluster %d',x),1:bestK,'UniformOutput',false));
+grid on;
+
+% ================= 8. Plot Elevation vs Latitude (clustered) ===========
+figure; % Fig 4
+gscatter(lat, elev, labels, lines(bestK), 's', 20);
+xlabel('Latitude'); ylabel('Elevation (m)');
+title('Cluster Separation by Latitude and Elevation');
+legend(arrayfun(@(x) sprintf('Cluster %d',x),1:bestK,'UniformOutput',false));
+grid on;
+
+% ================ 9. Plot Elevation vs Longitude (clustered) ============
+figure; % Fig 5
+gscatter(lon, elev, labels, lines(bestK), 'd', 20);
+xlabel('Longitude'); ylabel('Elevation (m)');
+title('Cluster Separation by Longitude and Elevation');
+legend(arrayfun(@(x) sprintf('Cluster %d',x),1:bestK,'UniformOutput',false));
+grid on;
+
+% ========== 2D Scatter Plot: K-means Clustering with Centroids ===========
+figure; % Fig 6
+gscatter(lon, lat, labels); hold on;
+% Extract centroid coordinates (last 2 columns = lat, lon)
+centroid_lat  = centroids(:, end-2);
+centroid_lon  = centroids(:, end-1);
+% Plot centroids as black stars
+scatter(centroid_lon, centroid_lat, 200, 'k', 'p', 'filled');
+
+% Add text labels for centroids
+for c = 1:bestK
+   text(centroid_lon(c), centroid_lat(c), ...
+    sprintf('C%d', c), 'FontSize', 12, 'FontWeight', 'bold', ...
+    'Color', 'k', 'VerticalAlignment', 'bottom', 'HorizontalAlignment', 'right');
+end
+xlabel('Longitude');
+ylabel('Latitude');
+title('K-means Clustering of GDM points with Centroids');
+legend('Cluster 1','Cluster 2','Cluster 3','Cluster 4','Cluster 5','Cluster Centroids','Location','best');
+grid on;
+
+% ================= 10. 3D Scatter Plot with Centroids ==================
+% Plot each cluster individually with the same colors as Figure 6
+
+figure; % Fig 7
+colors = lines(bestK);
+for i = 1:bestK
+    cluster_points = labels == i;
+    scatter3(lon(cluster_points), lat(cluster_points), elev(cluster_points), ...
+        80, colors(i,:), 'filled', 'DisplayName', sprintf('Cluster %d', i)); 
+    hold on;
+end
+centroid_elev = centroids(:, end); % Extract centroid elevation
+
+% Plot centroids as big black stars with text labels for each centroid
+scatter3(centroid_lon, centroid_lat, centroid_elev, 200, 'k', 'p', 'filled', ...
+    'DisplayName', 'Cluster Centroids');
+for c = 1:bestK
+    text(centroid_lon(c), centroid_lat(c), centroid_elev(c), ...
+        sprintf('C%d', c), 'FontSize', 12, 'FontWeight', 'bold', ...
+        'Color', 'k', 'VerticalAlignment', 'bottom', 'HorizontalAlignment', 'right');
+end
+
+xlabel('Longitude'); ylabel('Latitude'); zlabel('Elevation (m)');
+title('3D Spatial Distribution of GDM Point Clusters with Centroids');
+grid on; view(45,30);
+legend('show', 'Location', 'best');
+
+
